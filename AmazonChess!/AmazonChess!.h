@@ -132,6 +132,9 @@ namespace AmazonChess
         Player CurrentPlayer() const { return currentPlayer; }
         TurnPhase CurrentPhase() const { return phase; }
 
+        // 新增：设置当前玩家（用于逐步重放中设置玩家）
+        void SetCurrentPlayer(Player p) { currentPlayer = p; }
+
         // 检查指定玩家是否被封死（即所有 Amazon 无任何可移动位置）
         bool IsPlayerTrapped(Player player) const;
 

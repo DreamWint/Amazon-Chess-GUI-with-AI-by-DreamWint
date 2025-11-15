@@ -1,4 +1,4 @@
-﻿// AmazonChess!.cpp : 定义应用程序的入口点，并包含 Game 的实现，使用 GDI+ 绘制。
+﻿// AmazonChess!.cpp : 定义应用程序的入口点，并包含 Game 的 实现，使用 GDI+ 绘制。
 // 使用 C++14
 #include "framework.h"
 #include "AmazonChess!.h"
@@ -13,6 +13,7 @@
 #include <locale>
 #include <codecvt>
 #include <commdlg.h>
+#include <thread>           // 新增：用于 sleep_for
 #include "AmazonAI.h"
 
 using namespace AmazonChess;
@@ -31,13 +32,16 @@ WCHAR szWindowClass[MAX_LOADSTRING];            // 主窗口类名
 // GDI+ token
 static ULONG_PTR g_gdiplusToken = 0;
 
+// Replay / step 模式相关全局标志
+static bool g_isReplaying = false; // 当从记谱文件重放时设为 true，避免触发 AI
+static bool g_stepReplay = false;  // 如果为 true，表示处于按空格逐步显示的重放模式
+static size_t g_replayIndex = 0;   // 重放中下一个要执行的记谱索引
+
 // 此代码模块中包含的函数的前向声明:
 ATOM                MyRegisterClass(HINSTANCE hInstance);
 BOOL                InitInstance(HINSTANCE, int);
 LRESULT CALLBACK    WndProc(HWND, UINT, WPARAM, LPARAM);
 INT_PTR CALLBACK    About(HWND, UINT, WPARAM, LPARAM);
-
-static bool g_isReplaying = false; // 当从记谱文件重放时设为 true，避免触发 AI
 
 //
 // GDI+ 初始化/清理
@@ -123,7 +127,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 //  函数: MyRegisterClass()
 //
 //  目标: 注册窗口类。
-//
+// 
 ATOM MyRegisterClass(HINSTANCE hInstance)
 {
     WNDCLASSEXW wcex;
@@ -687,9 +691,25 @@ namespace AmazonChess
                 Pos fromPos(fromIndex % BOARD_SIZE, fromIndex / BOARD_SIZE);
                 Pos toPos(toIndex % BOARD_SIZE, toIndex / BOARD_SIZE);
 
+                // 在执行 AI 动作前延迟 1 秒（让玩家看清回合切换）
+                if (g_hMainWnd)
+                {
+                    InvalidateRect(g_hMainWnd, NULL, FALSE);
+                    UpdateWindow(g_hMainWnd);
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+
                 // 执行 AI 的移动 - MoveAmazon 会设 lastMoveFrom/To
                 if (MoveAmazon(fromPos, toPos))
                 {
+                    // 显示 AI 移动后的界面并暂停 1 秒再发箭
+                    if (g_hMainWnd)
+                    {
+                        InvalidateRect(g_hMainWnd, NULL, FALSE);
+                        UpdateWindow(g_hMainWnd);
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+
                     // 若 AI 返回了箭位置则放箭；否则尝试选择第一个可达格作为箭（防防万一）
                     if (best.second >= 0)
                     {
@@ -780,50 +800,77 @@ namespace AmazonChess
     }
 
     // 从文件读取并重放（从初始局面开始）
+    // 修改：如果是 "Initialization.acp"（启动时读取初始局面），保留原来立即应用的行为。
+    // 否则：加载所有记谱行到 moves，并进入按空格逐步重放模式（g_stepReplay=true）。
     bool Game::LoadFromFile(const std::wstring& path)
     {
         std::wifstream ifs(path, std::ios::binary);
         if (!ifs.is_open()) return false;
         ifs.imbue(std::locale(ifs.getloc(), new std::codecvt_utf8<wchar_t>));
 
-        // 标记为重放，防止在重放期触发 AI
-        g_isReplaying = true;
+        // 特殊处理 Initialization.acp：立即执行（保持原行为）
+        if (path == L"Initialization.acp")
+        {
+            // 标记为重放，防止在重放期触发 AI
+            g_isReplaying = true;
 
-        // 从初始局面开始重放
+            // 从初始局面开始重放
+            Reset();
+            moves.clear();
+
+            std::wstring line;
+            bool success = true;
+            while (std::getline(ifs, line))
+            {
+                // trim CRLF and spaces
+                while (!line.empty() && (line.back() == L'\r' || line.back() == L'\n' || line.back() == L' ' || line.back() == L'\t')) line.pop_back();
+                if (line.empty()) continue;
+
+                bool hadStar = false;
+                if (!line.empty() && line.back() == L'*') { hadStar = true; line.pop_back(); }
+
+                std::wistringstream iss(line);
+                std::wstring playerToken, fromStr, toStr, arrowStr;
+                if (!(iss >> playerToken >> fromStr >> toStr >> arrowStr)) { success = false; break; }
+
+                Player p = (playerToken == L"W") ? Player::White : Player::Black;
+
+                Pos from, to, arrow;
+                if (!StringToPos(fromStr, from) || !StringToPos(toStr, to) || !StringToPos(arrowStr, arrow)) { success = false; break; }
+
+                // 为了让 MoveAmazon 校验正常，设置 currentPlayer 成为该行的玩家
+                currentPlayer = p;
+
+                if (!MoveAmazon(from, to)) { success = false; break; }
+                if (!ShootArrow(arrow)) { success = false; break; }
+
+                if (hadStar) break;
+            }
+
+            g_isReplaying = false;
+            return true;
+        }
+
+        // 非 Initialization.acp：读取到 moves 中，进入按空格逐步显示模式
         Reset();
         moves.clear();
 
         std::wstring line;
-        bool success = true;
         while (std::getline(ifs, line))
         {
-            // trim CRLF and spaces
-            while (!line.empty() && (line.back() == L'\r' || line.back() == L'\n' || line.back() == L' ' || line.back() == L'\t')) line.pop_back();
+            // trim CRLF and spaces (保留 '*' 在末尾以便识别终局)
+            while (!line.empty() && (line.back() == L'\r' || line.back() == L'\n')) line.pop_back();
             if (line.empty()) continue;
-
-            bool hadStar = false;
-            if (!line.empty() && line.back() == L'*') { hadStar = true; line.pop_back(); }
-
-            std::wistringstream iss(line);
-            std::wstring playerToken, fromStr, toStr, arrowStr;
-            if (!(iss >> playerToken >> fromStr >> toStr >> arrowStr)) { success = false; break; }
-
-            Player p = (playerToken == L"W") ? Player::White : Player::Black;
-
-            Pos from, to, arrow;
-            if (!StringToPos(fromStr, from) || !StringToPos(toStr, to) || !StringToPos(arrowStr, arrow)) { success = false; break; }
-
-            // 为了让 MoveAmazon 校验正常，设置 currentPlayer 成为该行的玩家
-            currentPlayer = p;
-
-            if (!MoveAmazon(from, to)) { success = false; break; }
-            if (!ShootArrow(arrow)) { success = false; break; }
-
-            if (hadStar) break;
+            // 保留行（包含可能的 '*'）
+            moves.push_back(line);
         }
 
-        g_isReplaying = false;
-        return success;
+        // 进入逐步重放模式：设置全局标志，等待用户通过空格推进
+        g_isReplaying = true;   // 防止在重放过程中触发 AI
+        g_stepReplay = true;
+        g_replayIndex = 0;
+
+        return true;
     }
 
     const std::vector<std::wstring>& Game::GetMoveList() const { return moves; }
@@ -900,6 +947,74 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 break;
             default:
                 return DefWindowProc(hWnd, message, wParam, lParam);
+            }
+        }
+        break;
+
+    case WM_KEYDOWN:
+        {
+            // 逐步重放：按空格执行下一手
+            if (wParam == VK_SPACE && g_isReplaying && g_stepReplay)
+            {
+                auto &moves = GetGlobalGame().GetMoveList();
+                if (g_replayIndex < moves.size())
+                {
+                    // 解析当前行
+                    std::wstring line = moves[g_replayIndex];
+                    // trim trailing spaces and CR/LF
+                    while (!line.empty() && (line.back() == L'\r' || line.back() == L'\n' || line.back() == L' ' || line.back() == L'\t')) line.pop_back();
+                    bool hadStar = false;
+                    if (!line.empty() && line.back() == L'*') { hadStar = true; line.pop_back(); }
+
+                    std::wistringstream iss(line);
+                    std::wstring playerToken, fromStr, toStr, arrowStr;
+                    if (iss >> playerToken >> fromStr >> toStr >> arrowStr)
+                    {
+                        Player p = (playerToken == L"W") ? Player::White : Player::Black;
+                        Pos from, to, arrow;
+                        if (StringToPos(fromStr, from) && StringToPos(toStr, to) && StringToPos(arrowStr, arrow))
+                        {
+                            // 设置当前玩家以通过 MoveAmazon 的校验
+                            GetGlobalGame().SetCurrentPlayer(p); // 使用新增加的公有 setter
+                            // 执行落子（显示后暂停 1s），然后发箭（显示后暂停 1s）
+                            if (GetGlobalGame().MoveAmazon(from, to))
+                            {
+                                if (g_hMainWnd)
+                                {
+                                    InvalidateRect(g_hMainWnd, NULL, FALSE);
+                                    UpdateWindow(g_hMainWnd);
+                                }
+                                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+                                GetGlobalGame().ShootArrow(arrow); // ShootArrow 内会记录并切换玩家
+                                if (g_hMainWnd)
+                                {
+                                    InvalidateRect(g_hMainWnd, NULL, FALSE);
+                                    UpdateWindow(g_hMainWnd);
+                                }
+                                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+                            }
+                        }
+                    }
+
+                    ++g_replayIndex;
+
+                    // 如果这是终局（hadStar）或已无更多步骤，则退出逐步重放模式
+                    if (hadStar || g_replayIndex >= moves.size())
+                    {
+                        g_isReplaying = false;
+                        g_stepReplay = false;
+                        g_replayIndex = 0;
+                    }
+                }
+                else
+                {
+                    // 没有更多步骤：退出重放模式
+                    g_isReplaying = false;
+                    g_stepReplay = false;
+                    g_replayIndex = 0;
+                }
+
+                InvalidateRect(hWnd, NULL, FALSE);
             }
         }
         break;
